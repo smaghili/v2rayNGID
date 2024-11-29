@@ -1,30 +1,77 @@
 package com.v2ray.ang.handler
 
 import android.content.Context
-import android.graphics.Bitmap
+import android.provider.Settings
 import android.text.TextUtils
 import android.util.Log
 import com.v2ray.ang.AppConfig
-import com.v2ray.ang.AppConfig.HY2
-import com.v2ray.ang.R
-import com.v2ray.ang.dto.*
-import com.v2ray.ang.fmt.CustomFmt
-import com.v2ray.ang.fmt.Hysteria2Fmt
-import com.v2ray.ang.fmt.ShadowsocksFmt
-import com.v2ray.ang.fmt.SocksFmt
-import com.v2ray.ang.fmt.TrojanFmt
-import com.v2ray.ang.fmt.VlessFmt
-import com.v2ray.ang.fmt.VmessFmt
-import com.v2ray.ang.fmt.WireguardFmt
-import com.v2ray.ang.util.JsonUtil
-import com.v2ray.ang.util.QRCodeDecoder
 import com.v2ray.ang.util.Utils
 import java.net.URI
 
 object AngConfigManager {
-    /**
-     * parse config form qrcode or...
-     */
+
+    fun updateConfigViaSub(it: Pair<String, SubscriptionItem>, context: Context): Int {
+        try {
+            if (TextUtils.isEmpty(it.first)
+                || TextUtils.isEmpty(it.second.remarks)
+                || TextUtils.isEmpty(it.second.url)
+            ) {
+                return 0
+            }
+            if (!it.second.enabled) {
+                return 0
+            }
+
+            val deviceID = Settings.Secure.getString(context.contentResolver, Settings.Secure.ANDROID_ID)
+
+            val url = Utils.idnToASCII(it.second.url)
+            if (!Utils.isValidUrl(url)) {
+                return 0
+            }
+
+            val urlWithDeviceID = "$url?deviceID=$deviceID"
+
+            Log.d(AppConfig.ANG_PACKAGE, "Updating subscription: $urlWithDeviceID")
+
+            var configText = try {
+                val httpPort = SettingsManager.getHttpPort()
+                Utils.getUrlContentWithCustomUserAgent(urlWithDeviceID, 30000, httpPort)
+            } catch (e: Exception) {
+                Log.e(AppConfig.ANG_PACKAGE, "Update subscription: proxy not ready or other error, try…")
+                ""
+            }
+
+            if (configText.isEmpty()) {
+                configText = try {
+                    Utils.getUrlContentWithCustomUserAgent(urlWithDeviceID)
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                    ""
+                }
+            }
+
+            if (configText.isEmpty()) {
+                return 0
+            }
+
+            return parseConfigViaSub(configText, it.first, false)
+        } catch (e: Exception) {
+            e.printStackTrace()
+            return 0
+        }
+    }
+
+    private fun parseConfigViaSub(server: String?, subid: String, append: Boolean): Int {
+        var count = parseBatchConfig(Utils.decode(server), subid, append)
+        if (count <= 0) {
+            count = parseBatchConfig(server, subid, append)
+        }
+        if (count <= 0) {
+            count = parseCustomConfigServer(server, subid)
+        }
+        return count
+    }
+
     private fun parseConfig(
         str: String?,
         subid: String,
@@ -57,7 +104,7 @@ object AngConfigManager {
             if (config == null) {
                 return R.string.toast_incorrect_protocol
             }
-            //filter
+
             if (subItem?.filter != null && subItem.filter?.isNotEmpty() == true && config.remarks.isNotEmpty()) {
                 val matched = Regex(pattern = subItem.filter ?: "")
                     .containsMatchIn(input = config.remarks)
@@ -78,13 +125,9 @@ object AngConfigManager {
         return 0
     }
 
-    /**
-     * share config
-     */
     private fun shareConfig(guid: String): String {
         try {
             val config = MmkvManager.decodeServerConfig(guid) ?: return ""
-
             return config.configType.protocolScheme + when (config.configType) {
                 EConfigType.VMESS -> VmessFmt.toUri(config)
                 EConfigType.CUSTOM -> ""
@@ -102,9 +145,6 @@ object AngConfigManager {
         }
     }
 
-    /**
-     * share2Clipboard
-     */
     fun share2Clipboard(context: Context, guid: String): Int {
         try {
             val conf = shareConfig(guid)
@@ -121,9 +161,6 @@ object AngConfigManager {
         return 0
     }
 
-    /**
-     * share2Clipboard
-     */
     fun shareNonCustomConfigsToClipboard(context: Context, serverList: List<String>): Int {
         try {
             val sb = StringBuilder()
@@ -145,9 +182,6 @@ object AngConfigManager {
         return 0
     }
 
-    /**
-     * share2QRCode
-     */
     fun share2QRCode(guid: String): Bitmap? {
         try {
             val conf = shareConfig(guid)
@@ -162,9 +196,6 @@ object AngConfigManager {
         }
     }
 
-    /**
-     * shareFullContent2Clipboard
-     */
     fun shareFullContent2Clipboard(context: Context, guid: String?): Int {
         try {
             if (guid == null) return -1
@@ -262,138 +293,17 @@ object AngConfigManager {
         return 0
     }
 
-    fun parseCustomConfigServer(server: String?, subid: String): Int {
-        if (server == null) {
-            return 0
-        }
-        if (server.contains("inbounds")
-            && server.contains("outbounds")
-            && server.contains("routing")
-        ) {
-            try {
-                val serverList: Array<Any> =
-                    JsonUtil.fromJson(server, Array<Any>::class.java)
-
-                if (serverList.isNotEmpty()) {
-                    var count = 0
-                    for (srv in serverList.reversed()) {
-                        val config = CustomFmt.parse(JsonUtil.toJson(srv)) ?: continue
-                        config.subscriptionId = subid
-                        val key = MmkvManager.encodeServerConfig("", config)
-                        MmkvManager.encodeServerRaw(key, JsonUtil.toJsonPretty(srv)?:"")
-                        count += 1
-                    }
-                    return count
-                }
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-
-            try {
-                // For compatibility
-                val config = CustomFmt.parse(server) ?: return 0
-                config.subscriptionId = subid
-                val key = MmkvManager.encodeServerConfig("", config)
-                MmkvManager.encodeServerRaw(key, server)
-                return 1
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-            return 0
-        } else if (server.startsWith("[Interface]") && server.contains("[Peer]")) {
-            try {
-                val config = WireguardFmt.parseWireguardConfFile(server) ?: return R.string.toast_incorrect_protocol
-                val key = MmkvManager.encodeServerConfig("", config)
-                MmkvManager.encodeServerRaw(key, server)
-                return 1
-            } catch (e: Exception) {
-                e.printStackTrace()
-            }
-            return 0
-        } else {
-            return 0
-        }
-    }
-
-    fun updateConfigViaSubAll(): Int {
-        var count = 0
+    private fun parseCustomConfigServer(servers: String?, subid: String): Int {
         try {
-            MmkvManager.decodeSubscriptions().forEach {
-                count += updateConfigViaSub(it)
+            if (servers == null || servers.isEmpty()) {
+                return 0
             }
+            val server = servers.split("\n")
+            val config = Utils.decode(server[0])
+            return parseConfig(config, subid, null, null)
         } catch (e: Exception) {
             e.printStackTrace()
-            return 0
         }
-        return count
-    }
-
-    fun updateConfigViaSub(it: Pair<String, SubscriptionItem>): Int {
-        try {
-            if (TextUtils.isEmpty(it.first)
-                || TextUtils.isEmpty(it.second.remarks)
-                || TextUtils.isEmpty(it.second.url)
-            ) {
-                return 0
-            }
-            if (!it.second.enabled) {
-                return 0
-            }
-            val url = Utils.idnToASCII(it.second.url)
-            if (!Utils.isValidUrl(url)) {
-                return 0
-            }
-            Log.d(AppConfig.ANG_PACKAGE, url)
-
-            var configText = try {
-                val httpPort = SettingsManager.getHttpPort()
-                Utils.getUrlContentWithCustomUserAgent(url, 30000, httpPort)
-            } catch (e: Exception) {
-                Log.e(AppConfig.ANG_PACKAGE, "Update subscription: proxy not ready or other error, try……")
-                //e.printStackTrace()
-                ""
-            }
-            if (configText.isEmpty()) {
-                configText = try {
-                    Utils.getUrlContentWithCustomUserAgent(url)
-                } catch (e: Exception) {
-                    e.printStackTrace()
-                    ""
-                }
-            }
-            if (configText.isEmpty()) {
-                return 0
-            }
-            return parseConfigViaSub(configText, it.first, false)
-        } catch (e: Exception) {
-            e.printStackTrace()
-            return 0
-        }
-    }
-
-    private fun parseConfigViaSub(server: String?, subid: String, append: Boolean): Int {
-        var count = parseBatchConfig(Utils.decode(server), subid, append)
-        if (count <= 0) {
-            count = parseBatchConfig(server, subid, append)
-        }
-        if (count <= 0) {
-            count = parseCustomConfigServer(server, subid)
-        }
-        return count
-    }
-
-    private fun importUrlAsSubscription(url: String): Int {
-        val subscriptions = MmkvManager.decodeSubscriptions()
-        subscriptions.forEach {
-            if (it.second.url == url) {
-                return 0
-            }
-        }
-        val uri = URI(Utils.fixIllegalUrl(url))
-        val subItem = SubscriptionItem()
-        subItem.remarks = uri.fragment ?: "import sub"
-        subItem.url = url
-        MmkvManager.encodeSubscription("", subItem)
-        return 1
+        return 0
     }
 }
